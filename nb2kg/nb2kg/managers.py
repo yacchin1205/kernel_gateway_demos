@@ -4,6 +4,8 @@
 import os
 import json
 
+from functools import reduce
+
 from tornado import gen, web
 from tornado.escape import json_encode, json_decode, url_escape
 from tornado.httpclient import HTTPClient, AsyncHTTPClient, HTTPError
@@ -17,32 +19,88 @@ from notebook.utils import url_path_join
 
 from traitlets import Instance, Unicode, default
 
-# TODO: Find a better way to specify global configuration options 
+# TODO: Find a better way to specify global configuration options
 # for a server extension.
-KG_URL = os.getenv('KG_URL', 'http://127.0.0.1:8888/')
+KG_URLS = os.getenv('KG_URLS', 'kg_urls.json')
 KG_HEADERS = json.loads(os.getenv('KG_HEADERS', '{}'))
 KG_HEADERS.update({
     'Authorization': 'token {}'.format(os.getenv('KG_AUTH_TOKEN', ''))
 })
 VALIDATE_KG_CERT = os.getenv('VALIDATE_KG_CERT') not in ['no', 'false']
 
+_kg_urls = []
+_kernel_descs = {}
+
+def get_kg_url(kernel_id):
+    local_kg_url = None
+    for kg_name, kg_url in get_kg_urls():
+        if _kernel_descs[kernel_id].endswith('_{}'.format(kg_name)):
+            return kg_url
+        elif kg_name == 'local':
+            local_kg_url = kg_url
+    return local_kg_url
+
+def get_kg_urls():
+    global _kg_urls
+    if not _kg_urls:
+        with open(KG_URLS, 'r') as f:
+            _kg_urls = json.load(f)
+        _kg_urls = list(map(lambda e: (e['name'], e['url']), _kg_urls))
+    return _kg_urls
+
+def remove_kg_suffix(kernel_name):
+    for kg_name, kg_url in get_kg_urls():
+        if kernel_name.endswith('_{}'.format(kg_name)):
+            return kernel_name[:-(len(kg_name) + 1)]
+    return kernel_name
+
 @gen.coroutine
-def fetch_kg(endpoint, **kwargs):
+def fetch_kgs(endpoint, **kwargs):
     """Make an async request to kernel gateway endpoint."""
     client = AsyncHTTPClient()
-    url = url_path_join(KG_URL, endpoint)
-    response = yield client.fetch(url, headers=KG_HEADERS, validate_cert=VALIDATE_KG_CERT, **kwargs)
-    raise gen.Return(response)
+    responses = {}
+    for kg_name, kg_url in get_kg_urls():
+        url = url_path_join(kg_url, endpoint)
+        responses[kg_name] = client.fetch(url, headers=KG_HEADERS,
+                                          validate_cert=VALIDATE_KG_CERT,
+                                          **kwargs)
+    responses_obj = yield responses
+    raise gen.Return(responses_obj)
+
+@gen.coroutine
+def fetch_kg(kernel_name, endpoint, **kwargs):
+    """Make an async request to kernel gateway endpoint."""
+    client = AsyncHTTPClient()
+    response = {}
+    local_kg_url = None
+    for kg_name, kg_url in get_kg_urls():
+        if kernel_name.endswith('_{}'.format(kg_name)):
+            url = url_path_join(kg_url, endpoint)
+            response = client.fetch(url, headers=KG_HEADERS,
+                                    validate_cert=VALIDATE_KG_CERT,
+                                    **kwargs)
+            response_obj = yield response
+            raise gen.Return(response_obj)
+        elif kg_name == 'local':
+            local_kg_url = kg_url
+
+    url = url_path_join(local_kg_url, endpoint)
+    response = client.fetch(url, headers=KG_HEADERS,
+                            validate_cert=VALIDATE_KG_CERT,
+                            **kwargs)
+    response_obj = yield response
+    raise gen.Return(response_obj)
 
 
 class RemoteKernelManager(MappingKernelManager):
-    """Kernel manager that supports remote kernels hosted by Jupyter 
+    """Kernel manager that supports remote kernels hosted by Jupyter
     kernel gateway."""
 
     kernels_endpoint_env = 'KG_KERNELS_ENDPOINT'
     kernels_endpoint = Unicode(config=True,
-        help="""The kernel gateway API endpoint for accessing kernel resources 
+        help="""The kernel gateway API endpoint for accessing kernel resources
         (KG_KERNELS_ENDPOINT env var)""")
+
     @default('kernels_endpoint')
     def kernels_endpoint_default(self):
         return os.getenv(self.kernels_endpoint_env, '/api/kernels')
@@ -57,13 +115,13 @@ class RemoteKernelManager(MappingKernelManager):
     #  - replace `__contains__` with more formal async get_kernel() API
     #    (requires notebook code base changes)
     _kernels = {}
-    
+
     def __contains__(self, kernel_id):
         self.log.debug('RemoteKernelManager.__contains__ {}'.format(kernel_id))
         return kernel_id in self._kernels
 
     def _remove_kernel(self, kernel_id):
-        """Remove a kernel from our mapping, mainly so that a dead kernel can be 
+        """Remove a kernel from our mapping, mainly so that a dead kernel can be
         removed without having to call shutdown_kernel.
 
         The kernel object is returned.
@@ -109,12 +167,14 @@ class RemoteKernelManager(MappingKernelManager):
             kernel_name = kwargs.get('kernel_name', 'python3')
             self.log.info("Request new kernel at: %s" % self.kernels_endpoint)
             response = yield fetch_kg(
+                kernel_name,
                 self.kernels_endpoint,
                 method='POST',
-                body=json_encode({'name' : kernel_name})
+                body=json_encode({'name' : remove_kg_suffix(kernel_name)})
             )
             kernel = json_decode(response.body)
             kernel_id = kernel['id']
+            _kernel_descs[kernel_id] = kernel_name
             self.log.info("Kernel started: %s" % kernel_id)
         else:
             kernel = yield self.get_kernel(kernel_id)
@@ -135,7 +195,8 @@ class RemoteKernelManager(MappingKernelManager):
         kernel_url = self._kernel_id_to_url(kernel_id)
         self.log.info("Request kernel at: %s" % kernel_url)
         try:
-            response = yield fetch_kg(kernel_url, method='GET')
+            response = yield fetch_kg(_kernel_descs[kernel_id], kernel_url,
+                                      method='GET')
         except HTTPError as error:
             if error.code == 404:
                 self.log.info("Kernel not found at: %s" % kernel_url)
@@ -167,8 +228,11 @@ class RemoteKernelManager(MappingKernelManager):
     def list_kernels(self, **kwargs):
         """Get a list of kernels."""
         self.log.info("Request list kernels: %s", kwargs)
-        response = yield fetch_kg(self.kernels_endpoint, method='GET')
-        kernels = json_decode(response.body)
+        responses = yield fetch_kgs(self.kernels_endpoint, method='GET')
+        kernels = reduce(lambda x, y: x + y,
+                         map(lambda kg_url: self._conv_kernel(kg_url[0],
+                                                              json_decode(responses[kg_url[0]].body)),
+                             get_kg_urls()))
         self._kernels = {x['id']:x for x in kernels}
         raise gen.Return(kernels)
 
@@ -184,7 +248,8 @@ class RemoteKernelManager(MappingKernelManager):
         self.log.info("Request shutdown kernel: %s", kernel_id)
         kernel_url = self._kernel_id_to_url(kernel_id)
         self.log.info("Request delete kernel at: %s", kernel_url)
-        response = yield fetch_kg(kernel_url, method='DELETE')
+        response = yield fetch_kg(_kernel_descs[kernel_id], kernel_url,
+                                  method='DELETE')
         self.log.info("Shutdown kernel response: %d %s",
             response.code, response.reason)
         self._remove_kernel(kernel_id)
@@ -202,6 +267,7 @@ class RemoteKernelManager(MappingKernelManager):
         kernel_url = self._kernel_id_to_url(kernel_id) + '/restart'
         self.log.info("Request restart kernel at: %s", kernel_url)
         response = yield fetch_kg(
+            _kernel_descs[kernel_id],
             kernel_url,
             method='POST',
             body=json_encode({})
@@ -221,7 +287,8 @@ class RemoteKernelManager(MappingKernelManager):
         self.log.info("Request interrupt kernel: %s", kernel_id)
         kernel_url = self._kernel_id_to_url(kernel_id) + '/interrupt'
         self.log.info("Request restart kernel at: %s", kernel_url)
-        response = yield fetch_kg(kernel_url,
+        response = yield fetch_kg(_kernel_descs[kernel_id],
+            kernel_url,
             method='POST',
             body=json_encode({})
         )
@@ -232,28 +299,37 @@ class RemoteKernelManager(MappingKernelManager):
         """Shutdown all kernels."""
         # TODO: Is it appropriate to do this?  Is this notebook server the
         # only client of the kernel gateway?
-        # TODO: We also have to make this sync because the NotebookApp does not 
+        # TODO: We also have to make this sync because the NotebookApp does not
         # wait for async.
         client = HTTPClient()
         for kernel_id in self._kernels.keys():
             kernel_url = url_path_join(KG_URL, self._kernel_id_to_url(kernel_id))
             self.log.info("Request delete kernel at: %s", kernel_url)
             try:
-                response = client.fetch(kernel_url, 
+                response = client.fetch(kernel_url,
                     headers=KG_HEADERS,
                     method='DELETE'
                 )
             except HTTPError:
                 pass
-            self.log.info("Delete kernel response: %d %s", 
+            self.log.info("Delete kernel response: %d %s",
                 response.code, response.reason)
         client.close()
+
+    def _conv_kernel(self, kg_name, kernels):
+        if kg_name == 'local':
+            return kernels
+        else:
+            r = kernels.copy()
+            for e in r:
+                e['name'] = '{}_{}'.format(e['name'], kg_name)
+            return r
 
 class RemoteKernelSpecManager(KernelSpecManager):
 
     kernelspecs_endpoint_env = 'KG_KERNELSPECS_ENDPOINT'
     kernelspecs_endpoint = Unicode(config=True,
-        help="""The kernel gateway API endpoint for accessing kernelspecs 
+        help="""The kernel gateway API endpoint for accessing kernelspecs
         (KG_KERNELSPECS_ENDPOINT env var)""")
     @default('kernelspecs_endpoint')
     def kernelspecs_endpoint_default(self):
@@ -263,8 +339,11 @@ class RemoteKernelSpecManager(KernelSpecManager):
     def list_kernel_specs(self):
         """Get a list of kernel specs."""
         self.log.info("Request list kernel specs at: %s", self.kernelspecs_endpoint)
-        response = yield fetch_kg(self.kernelspecs_endpoint, method='GET')
-        kernel_specs = json_decode(response.body)
+        responses = yield fetch_kgs(self.kernelspecs_endpoint, method='GET')
+        kernel_specs = reduce(lambda x, y: self._merge_ks(x, y),
+                              map(lambda kg_url: self._conv_ks(kg_url[0],
+                                                               json_decode(responses[kg_url[0]].body)),
+                                  get_kg_urls()))
         raise gen.Return(kernel_specs)
 
     @gen.coroutine
@@ -279,7 +358,8 @@ class RemoteKernelSpecManager(KernelSpecManager):
         kernel_spec_url = url_path_join(self.kernelspecs_endpoint, str(kernel_name))
         self.log.info("Request kernel spec at: %s" % kernel_spec_url)
         try:
-            response = yield fetch_kg(kernel_spec_url, method='GET')
+            response = yield fetch_kg(kernel_name, kernel_spec_url,
+                                      method='GET')
         except HTTPError as error:
             if error.code == 404:
                 self.log.info("Kernel spec not found at: %s" % kernel_spec_url)
@@ -290,6 +370,27 @@ class RemoteKernelSpecManager(KernelSpecManager):
             kernel_spec = json_decode(response.body)
         raise gen.Return(kernel_spec)
 
+    def _conv_ks(self, kg_name, ks):
+        if kg_name == 'local':
+            return ks
+        else:
+            r = {'kernelspecs': {}}
+            for name, data in ks['kernelspecs'].items():
+                rks = data.copy()
+                rks['name'] = '{}_{}'.format(rks['name'], kg_name)
+                rks['spec']['display_name'] = '{} ({})'.format(rks['spec']['display_name'], kg_name)
+                r['kernelspecs']['{}_{}'.format(name, kg_name)] = rks
+            return r
+
+    def _merge_ks(self, ks1, ks2):
+        r = {}
+        if 'default' in ks1:
+            r['default'] = ks1['default']
+        if 'default' in ks2:
+            r['default'] = ks2['default']
+        r['kernelspecs'] = dict(list(ks1['kernelspecs'].items()) + list(ks2['kernelspecs'].items()))
+        return r
+
 
 class SessionManager(BaseSessionManager):
 
@@ -299,7 +400,7 @@ class SessionManager(BaseSessionManager):
     def create_session(self, path=None, name=None, type=None,
                        kernel_name=None, kernel_id=None):
         """Creates a session and returns its model.
-        
+
         Overrides base class method to turn into an async operation.
         """
         session_id = self.new_session_id()
@@ -308,7 +409,7 @@ class SessionManager(BaseSessionManager):
         if kernel_id is not None:
             # This is now an async operation
             kernel = yield self.kernel_manager.get_kernel(kernel_id)
-        
+
         if kernel is not None:
             pass
         else:
@@ -325,11 +426,11 @@ class SessionManager(BaseSessionManager):
     def save_session(self, session_id, path=None, name=None, type=None,
                      kernel_id=None):
         """Saves the items for the session with the given session_id
-        
+
         Given a session_id (and any other of the arguments), this method
         creates a row in the sqlite session database that holds the information
         for a session.
-        
+
         Parameters
         ----------
         session_id : str
@@ -338,7 +439,7 @@ class SessionManager(BaseSessionManager):
             the path for the given notebook
         kernel_id : str
             a uuid for the kernel associated with this session
-        
+
         Returns
         -------
         model : dict
@@ -353,7 +454,7 @@ class SessionManager(BaseSessionManager):
     @gen.coroutine
     def get_session(self, **kwargs):
         """Returns the model for a particular session.
-        
+
         Takes a keyword argument and searches for the value in the session
         database, then returns the rest of the session's info.
 
@@ -368,7 +469,7 @@ class SessionManager(BaseSessionManager):
         Returns
         -------
         model : dict
-            returns a dictionary that includes all the information from the 
+            returns a dictionary that includes all the information from the
             session described by the kwarg.
         """
         # This is now an async operation
@@ -378,19 +479,19 @@ class SessionManager(BaseSessionManager):
     @gen.coroutine
     def update_session(self, session_id, **kwargs):
         """Updates the values in the session database.
-        
+
         Changes the values of the session with the given session_id
-        with the values from the keyword arguments. 
+        with the values from the keyword arguments.
 
         Overrides base class method to turn into an async operation.
-        
+
         Parameters
         ----------
         session_id : str
             a uuid that identifies a session in the sqlite3 database
         **kwargs : str
             the key must correspond to a column title in session database,
-            and the value replaces the current value in the session 
+            and the value replaces the current value in the session
             with session_id.
         """
         # This is now an async operation
@@ -411,7 +512,7 @@ class SessionManager(BaseSessionManager):
     @gen.coroutine
     def row_to_model(self, row):
         """Takes sqlite database session row and turns it into a dictionary.
-        
+
         Overrides base class method to turn into an async operation.
         """
         # Retrieve kernel for session, which is now an async operation
@@ -420,7 +521,7 @@ class SessionManager(BaseSessionManager):
             # The kernel was killed or died without deleting the session.
             # We can't use delete_session here because that tries to find
             # and shut down the kernel.
-            self.cursor.execute("DELETE FROM session WHERE session_id=?", 
+            self.cursor.execute("DELETE FROM session WHERE session_id=?",
                                 (row['session_id'],))
             raise KeyError
 
@@ -437,7 +538,7 @@ class SessionManager(BaseSessionManager):
     def list_sessions(self):
         """Returns a list of dictionaries containing all the information from
         the session database.
-        
+
         Overrides base class method to turn into an async operation.
         """
         c = self.cursor.execute("SELECT * FROM session")
@@ -456,7 +557,7 @@ class SessionManager(BaseSessionManager):
     @gen.coroutine
     def delete_session(self, session_id):
         """Deletes the row in the session database with given session_id.
-        
+
         Overrides base class method to turn into an async operation.
         """
         # This is now an async operation

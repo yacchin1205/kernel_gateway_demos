@@ -10,7 +10,7 @@ services:
     ports:
      - "9888:8888"
     environment:
-      KG_URL: http://nb2kg-kg:8888
+      KG_URLS: /home/jovyan/kg.json
       KG_AUTH_TOKEN: colonels
     command: >
       jupyter notebook

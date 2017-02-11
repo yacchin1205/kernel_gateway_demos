@@ -19,9 +19,8 @@ from jupyter_client.session import Session
 from traitlets import Unicode, default
 from traitlets.config.configurable import LoggingConfigurable
 
-# TODO: Find a better way to specify global configuration options 
-# for a server extension.
-KG_URL = os.getenv('KG_URL', 'http://127.0.0.1:8888/')
+from nb2kg.managers import get_kg_url
+
 KG_HEADERS = json.loads(os.getenv('KG_HEADERS', '{}'))
 KG_HEADERS.update({
     'Authorization': 'token {}'.format(os.getenv('KG_AUTH_TOKEN', ''))
@@ -102,8 +101,8 @@ class KernelGatewayWSClient(LoggingConfigurable):
     @gen.coroutine
     def _connect(self, kernel_id):
         ws_url = url_path_join(
-            KG_URL.replace('http', 'ws'), 
-            '/api/kernels', 
+            get_kg_url(kernel_id).replace('http', 'ws'),
+            '/api/kernels',
             url_escape(kernel_id),
             'channels'
         )
